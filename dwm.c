@@ -16,6 +16,9 @@
 #include <strings.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include <unistd.h>
 #ifdef XINERAMA
 #include <X11/extensions/Xinerama.h>
@@ -38,7 +41,6 @@
   ((C)->swallowed == NULL &&                                                   \
    ((C)->tags & (C)->mon->tagset[(C)->mon->seltags]))
 #define HIDDEN(C) ((C)->ishidden)
-#define LENGTH(X) (sizeof(X) / sizeof((X)[0]))
 #define MOUSEMASK (BUTTONMASK | PointerMotionMask)
 #define WIDTH(X) ((X)->w + 2 * (X)->bw + gappx)
 #define HEIGHT(X) ((X)->h + 2 * (X)->bw + gappx)
@@ -1739,6 +1741,24 @@ long getstate(Window w) {
   return result;
 }
 
+/* strncpy may cut a multi-byte character in half; drop the broken tail so long
+ * titles end cleanly instead of with a replacement glyph. */
+static void utf8trimtail(char *s) {
+  size_t i = strlen(s), cont = 0, need;
+  unsigned char lead;
+
+  while (i > 0 && cont < 3 && ((unsigned char)s[i - 1] & 0xC0) == 0x80) {
+    i--;
+    cont++;
+  }
+  if (i == 0)
+    return;
+  lead = (unsigned char)s[i - 1];
+  need = lead >= 0xF0 ? 3 : lead >= 0xE0 ? 2 : lead >= 0xC0 ? 1 : 0;
+  if (need > cont)
+    s[i - 1] = '\0';
+}
+
 int gettextprop(Window w, Atom atom, char *text, unsigned int size) {
   char **list = NULL;
   int n, result;
@@ -1759,6 +1779,7 @@ int gettextprop(Window w, Atom atom, char *text, unsigned int size) {
       XFreeStringList(list);
   }
   text[size - 1] = '\0';
+  utf8trimtail(text);
   XFree(name.value);
   return text[0] != '\0';
 }
@@ -3280,6 +3301,10 @@ void unmanage(Client *c, int destroyed) {
   if (refocus && m == selmon && m->sel)
     XWarpPointer(dpy, None, m->sel->win, 0, 0, 0, 0, m->sel->w / 2,
                  m->sel->h / 2);
+#ifdef __GLIBC__
+  /* hand memory freed by closed windows back to the system */
+  malloc_trim(0);
+#endif
 }
 
 void unmapnotify(XEvent *e) {
