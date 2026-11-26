@@ -111,6 +111,9 @@ struct Client {
   int oldx, oldy, oldw, oldh;
   int basew, baseh, incw, inch, maxw, maxh, minw, minh;
   int bw, oldbw, fsbw;
+  /* Geometry and border last sent to the X server. c->x.. can differ from it
+   * (gaps, the borderless single window, hidden clients moved off screen). */
+  int srvx, srvy, srvw, srvh, srvbw;
   unsigned int tags;
   int isfixed, isfloating, isurgent, ishidden, neverfocus, oldstate,
       isfullscreen, needresize;
@@ -250,6 +253,7 @@ static void removesystrayicon(Client *i);
 static void resize(Client *c, int x, int y, int w, int h, int interact);
 static void resizebarwin(Monitor *m);
 static void resizeclient(Client *c, int x, int y, int w, int h);
+static void setsrvgeom(Client *c, int x, int y, int w, int h);
 static void resizefullscreen(Client *c, int x, int y, int w, int h);
 static void resizemouse(const Arg *arg);
 static void resizerequest(XEvent *e);
@@ -306,7 +310,8 @@ static void updatestatus(void);
 static void updatesystray(void);
 static void updatesystrayicongeom(Client *i, int w, int h);
 static void updatesystrayiconidentity(Client *i);
-static void updatesystrayiconstate(Client *i, XPropertyEvent *ev);
+static int updatesystrayiconstate(Client *i, XPropertyEvent *ev);
+static void updatename(Client *c);
 static void updatetitle(Client *c);
 static void updatewindowtype(Client *c);
 static void updatewmhints(Client *c);
@@ -323,6 +328,7 @@ static Client *prevzoom = NULL;
 static const char broken[] = "broken";
 static char sessionfile[64];
 static char stext[1024];
+static int statusdrawn;
 static int screen;
 static int sw, sh;
 static int bh, blw = 0;
@@ -950,7 +956,7 @@ void configurerequest(XEvent *e) {
       return;
     }
     if (ev->value_mask & CWBorderWidth) {
-      c->bw = ev->border_width;
+      c->bw = c->srvbw = ev->border_width;
       XSetWindowBorderWidth(dpy, c->win, (unsigned int)c->bw);
     }
     if (c->isfloating || !c->mon->lt[c->mon->sellt]->arrange) {
@@ -978,9 +984,10 @@ void configurerequest(XEvent *e) {
       if ((ev->value_mask & (CWX | CWY)) &&
           !(ev->value_mask & (CWWidth | CWHeight)))
         configure(c);
-      if (ISVISIBLE(c))
+      if (ISVISIBLE(c)) {
+        setsrvgeom(c, c->x, c->y, c->w, c->h);
         XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
-      else
+      } else
         c->needresize = 1;
     } else {
       configure(c);
@@ -1910,7 +1917,8 @@ void manage(Window w, XWindowAttributes *wa) {
   c->w = c->oldw = wa->width;
   c->h = c->oldh = wa->height;
   c->bw = borderpx;
-  c->oldbw = wa->border_width;
+  c->oldbw = c->srvbw = wa->border_width;
+  setsrvgeom(c, wa->x, wa->y, wa->width, wa->height);
 
   updatetitle(c);
   if (XGetTransientForHint(dpy, w, &trans) && (t = wintoclient(trans))) {
@@ -1933,7 +1941,7 @@ void manage(Window w, XWindowAttributes *wa) {
                  ? c->mon->my + bh
                  : c->mon->my);
   checkswallowed(c);
-  wc.border_width = c->bw;
+  wc.border_width = c->srvbw = c->bw;
   XConfigureWindow(dpy, w, CWBorderWidth, &wc);
   XSetWindowBorder(dpy, w, scheme[SchemeNorm][ColBorder].pixel);
   configure(c);
@@ -1958,6 +1966,7 @@ void manage(Window w, XWindowAttributes *wa) {
   }
   XChangeProperty(dpy, root, netatom[NetClientList], XA_WINDOW, 32,
                   PropModeAppend, (unsigned char *)&(c->win), 1);
+  setsrvgeom(c, c->x + 2 * sw, c->y, c->w, c->h);
   XMoveResizeWindow(dpy, c->win, c->x + 2 * sw, c->y, c->w, c->h);
   if (!HIDDEN(c))
     setclientstate(c, NormalState);
@@ -2130,8 +2139,8 @@ void propertynotify(XEvent *e) {
       updatesystrayicongeom(c, c->w, c->h);
       updatesystray();
     } else if (ev->atom == xatom[XembedInfo]) {
-      updatesystrayiconstate(c, ev);
-      updatesystray();
+      if (updatesystrayiconstate(c, ev))
+        updatesystray();
     }
     return;
   }
@@ -2150,13 +2159,13 @@ void propertynotify(XEvent *e) {
       if (ev->atom == netatom[NetWMState])
         setfullscreen(c, 0);
       else if (ev->atom == XA_WM_HINTS) {
+        int wasurgent = c->isurgent;
+
         c->isurgent = c->neverfocus = 0;
-        drawbar(c->mon);
-      } else if (ev->atom == XA_WM_NAME || ev->atom == netatom[NetWMName]) {
-        updatetitle(c);
-        if (c == c->mon->sel)
+        if (wasurgent)
           drawbar(c->mon);
-      }
+      } else if (ev->atom == XA_WM_NAME || ev->atom == netatom[NetWMName])
+        updatename(c);
       return;
     }
     switch (ev->atom) {
@@ -2170,16 +2179,17 @@ void propertynotify(XEvent *e) {
     case XA_WM_NORMAL_HINTS:
       updatesizehints(c);
       break;
-    case XA_WM_HINTS:
+    case XA_WM_HINTS: {
+      int wasurgent = c->isurgent;
+
       updatewmhints(c);
-      drawbar(c->mon);
+      if (c->isurgent != wasurgent)
+        drawbar(c->mon);
       break;
     }
-    if (ev->atom == XA_WM_NAME || ev->atom == netatom[NetWMName]) {
-      updatetitle(c);
-      if (c == c->mon->sel)
-        drawbar(c->mon);
     }
+    if (ev->atom == XA_WM_NAME || ev->atom == netatom[NetWMName])
+      updatename(c);
     if (ev->atom == netatom[NetWMWindowType]) {
       int wasfloating = c->isfloating;
 
@@ -2428,6 +2438,13 @@ void resizebarwin(Monitor *m) {
   XMoveResizeWindow(dpy, m->barwin, m->wx, m->by, m->ww, bh);
 }
 
+static void setsrvgeom(Client *c, int x, int y, int w, int h) {
+  c->srvx = x;
+  c->srvy = y;
+  c->srvw = w;
+  c->srvh = h;
+}
+
 void resizeclient(Client *c, int x, int y, int w, int h) {
   XWindowChanges wc;
   int gapoffset;
@@ -2458,6 +2475,13 @@ void resizeclient(Client *c, int x, int y, int w, int h) {
   c->oldh = c->h;
   c->h = wc.height = MAX(h - gapincr, 1);
 
+  /* Every arrange lands here for every visible client. Resending an
+   * unchanged geometry makes each client relayout and repaint for nothing. */
+  if (wc.x == c->srvx && wc.y == c->srvy && wc.width == c->srvw &&
+      wc.height == c->srvh && wc.border_width == c->srvbw)
+    return;
+  setsrvgeom(c, wc.x, wc.y, wc.width, wc.height);
+  c->srvbw = wc.border_width;
   XConfigureWindow(dpy, c->win, CWX | CWY | CWWidth | CWHeight | CWBorderWidth,
                    &wc);
   configure(c);
@@ -2969,8 +2993,11 @@ void showhide(Client *c) {
   if (ISVISIBLE(c)) {
     if (c->needresize) {
       c->needresize = 0;
+      setsrvgeom(c, c->x, c->y, c->w, c->h);
       XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
-    } else {
+    } else if (c->srvx != c->x || c->srvy != c->y) {
+      c->srvx = c->x;
+      c->srvy = c->y;
       XMoveWindow(dpy, c->win, c->x, c->y);
     }
     if ((!c->mon->lt[c->mon->sellt]->arrange || c->isfloating) &&
@@ -2980,7 +3007,11 @@ void showhide(Client *c) {
   } else {
 
     showhide(c->snext);
-    XMoveWindow(dpy, c->win, WIDTH(c) * -2, c->y);
+    if (c->srvx != WIDTH(c) * -2 || c->srvy != c->y) {
+      c->srvx = WIDTH(c) * -2;
+      c->srvy = c->y;
+      XMoveWindow(dpy, c->win, c->srvx, c->srvy);
+    }
   }
 }
 
@@ -3549,9 +3580,15 @@ void updatesizehints(Client *c) {
 }
 
 void updatestatus(void) {
+  char text[sizeof stext];
   Monitor *m;
-  if (!gettextprop(root, XA_WM_NAME, stext, sizeof(stext)))
-    strcpy(stext, "dwm-" VERSION);
+
+  if (!gettextprop(root, XA_WM_NAME, text, sizeof text))
+    strcpy(text, "dwm-" VERSION);
+  if (statusdrawn && strcmp(text, stext) == 0)
+    return;
+  memcpy(stext, text, sizeof stext);
+  statusdrawn = 1;
   for (m = mons; m; m = m->next)
     drawbar(m);
 }
@@ -3649,12 +3686,12 @@ void updatesystrayicongeom(Client *i, int w, int h) {
   }
 }
 
-void updatesystrayiconstate(Client *i, XPropertyEvent *ev) {
+int updatesystrayiconstate(Client *i, XPropertyEvent *ev) {
   unsigned long flags;
   long message;
 
   if (!showsystray || !i || ev->atom != xatom[XembedInfo])
-    return;
+    return 0;
   flags = getxembedflags(i->win);
 
   if ((flags & XEMBED_MAPPED) && !i->tags) {
@@ -3668,8 +3705,9 @@ void updatesystrayiconstate(Client *i, XPropertyEvent *ev) {
     XUnmapWindow(dpy, i->win);
     setclientstate(i, WithdrawnState);
   } else
-    return;
+    return 0;
   sendxembed(i->win, message);
+  return 1;
 }
 
 void updatesystray(void) {
@@ -3743,15 +3781,21 @@ void updatesystray(void) {
   XSync(dpy, False);
 }
 
+/* The bar shows only the app name, so a title change needs no redraw and no
+ * WM_CLASS round trip. Browsers and terminals retitle many times a second. */
+void updatename(Client *c) {
+  if (!gettextprop(c->win, netatom[NetWMName], c->name, sizeof c->name))
+    gettextprop(c->win, XA_WM_NAME, c->name, sizeof c->name);
+  if (c->name[0] == '\0')
+    snprintf(c->name, sizeof c->name, "%s", broken);
+}
+
 void updatetitle(Client *c) {
   XClassHint hint = {0};
   const char *app = "app";
   size_t i;
 
-  if (!gettextprop(c->win, netatom[NetWMName], c->name, sizeof c->name))
-    gettextprop(c->win, XA_WM_NAME, c->name, sizeof c->name);
-  if (c->name[0] == '\0')
-    snprintf(c->name, sizeof c->name, "%s", broken);
+  updatename(c);
 
   /* Keep the real title for window rules; only the app name goes in the bar. */
   XGetClassHint(dpy, c->win, &hint);
