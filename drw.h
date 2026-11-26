@@ -10,6 +10,7 @@ typedef struct Fnt {
 	XftFont *xfont;
 	FcPattern *pattern;
 	struct Fnt *next;
+	unsigned long used; /* last use, for evicting fallback fonts (LRU) */
 } Fnt;
 
 enum { ColFg, ColBg, ColBorder }; /* Clr scheme index */
