@@ -52,6 +52,10 @@ static const int nmaster = 1;
 static const int resizehints = 0;
 static const int lockfullscreen = 1;
 static const int swallowautomatic = 1;
+/* Above this many handled events or sent requests per second, dwm logs the
+ * event types and windows involved to $XDG_STATE_HOME/dwm/storm.log. */
+static const unsigned long stormevents = 2000;
+static const unsigned long stormrequests = 20000;
 /* Lowercase WM_CLASS names. Automatic swallowing needs inherited WINDOWID. */
 static const char *terminalapps[] = {"urxvt", "xterm", "st", "alacritty", "kitty"};
 static const Layout layouts[] = {

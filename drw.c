@@ -69,7 +69,10 @@ drw_create(Display *dpy, int screen, Window root, unsigned int w, unsigned int h
 	drw->w = w;
 	drw->h = h;
 	drw->drawable = XCreatePixmap(dpy, root, w, h, DefaultDepth(dpy, screen));
-	drw->gc = XCreateGC(dpy, root, 0, NULL);
+	/* Copies come from an offscreen pixmap that is never obscured: without this,
+	 * every bar redraw sends dwm a NoExpose event it has no use for. */
+	drw->gc = XCreateGC(dpy, root, GCGraphicsExposures,
+	                    &(XGCValues){ .graphics_exposures = False });
 	XSetLineAttributes(dpy, drw->gc, 1, LineSolid, CapButt, JoinMiter);
 
 	return drw;

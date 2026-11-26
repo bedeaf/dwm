@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #ifdef __GLIBC__
@@ -2164,8 +2166,7 @@ void propertynotify(XEvent *e) {
         c->isurgent = c->neverfocus = 0;
         if (wasurgent)
           drawbar(c->mon);
-      } else if (ev->atom == XA_WM_NAME || ev->atom == netatom[NetWMName])
-        updatename(c);
+      }
       return;
     }
     switch (ev->atom) {
@@ -2188,8 +2189,9 @@ void propertynotify(XEvent *e) {
       break;
     }
     }
-    if (ev->atom == XA_WM_NAME || ev->atom == netatom[NetWMName])
-      updatename(c);
+    /* No title handling: c->name only feeds window rules when the client is
+     * managed, and the bar shows the app name. Reading it here cost two round
+     * trips per retitle, and browsers or terminals retitle constantly. */
     if (ev->atom == netatom[NetWMWindowType]) {
       int wasfloating = c->isfloating;
 
@@ -2632,13 +2634,188 @@ void restack(Monitor *m) {
     ;
 }
 
+/* Event storm log. A feedback loop between dwm and a client freezes the
+ * screen while dwm and Xorg spin at full CPU, and leaves no trace. Each second
+ * the events dwm handled and the requests it sent are counted; above
+ * stormevents/stormrequests per second, one line goes to
+ * $XDG_STATE_HOME/dwm/storm.log naming the event types and windows involved. */
+enum { StormWindows = 8 };
+static struct {
+  long long start;
+  unsigned long events, requests, types[LASTEvent];
+  unsigned long reqbase;
+  struct {
+    Window win;
+    unsigned long n;
+  } wins[StormWindows];
+} storm;
+
+static const char *const eventnames[LASTEvent] = {
+    [KeyPress] = "KeyPress", [KeyRelease] = "KeyRelease",
+    [ButtonPress] = "ButtonPress", [ButtonRelease] = "ButtonRelease",
+    [MotionNotify] = "MotionNotify", [EnterNotify] = "EnterNotify",
+    [LeaveNotify] = "LeaveNotify", [FocusIn] = "FocusIn",
+    [FocusOut] = "FocusOut", [Expose] = "Expose",
+    [GraphicsExpose] = "GraphicsExpose", [NoExpose] = "NoExpose",
+    [VisibilityNotify] = "VisibilityNotify", [CreateNotify] = "CreateNotify",
+    [DestroyNotify] = "DestroyNotify", [UnmapNotify] = "UnmapNotify",
+    [MapNotify] = "MapNotify", [MapRequest] = "MapRequest",
+    [ReparentNotify] = "ReparentNotify", [ConfigureNotify] = "ConfigureNotify",
+    [ConfigureRequest] = "ConfigureRequest", [ResizeRequest] = "ResizeRequest",
+    [PropertyNotify] = "PropertyNotify", [SelectionClear] = "SelectionClear",
+    [ClientMessage] = "ClientMessage", [MappingNotify] = "MappingNotify",
+};
+
+static long long monotonicms(void) {
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* The window an event is about; for redirected requests xany.window is the
+ * parent (root), which would hide the client that causes a loop. */
+static Window eventwindow(const XEvent *ev) {
+  switch (ev->type) {
+  case MapRequest: return ev->xmaprequest.window;
+  case ConfigureRequest: return ev->xconfigurerequest.window;
+  case ResizeRequest: return ev->xresizerequest.window;
+  case CreateNotify: return ev->xcreatewindow.window;
+  case DestroyNotify: return ev->xdestroywindow.window;
+  case UnmapNotify: return ev->xunmap.window;
+  case MapNotify: return ev->xmap.window;
+  case ConfigureNotify: return ev->xconfigure.window;
+  default: return ev->xany.window;
+  }
+}
+
+static void stormwindowname(Window w, char *buf, size_t size) {
+  Client *c;
+  Monitor *m;
+
+  if (w == root) {
+    snprintf(buf, size, "root");
+    return;
+  }
+  for (m = mons; m; m = m->next)
+    if (w == m->barwin) {
+      snprintf(buf, size, "bar");
+      return;
+    }
+  if (systray && w == systray->win)
+    snprintf(buf, size, "tray");
+  else if ((c = wintoclient(w)))
+    snprintf(buf, size, "%.80s", c->appname);
+  else if ((c = wintosystrayicon(w)))
+    snprintf(buf, size, "tray icon %.70s", c->name);
+  else
+    snprintf(buf, size, "unmanaged");
+}
+
+static FILE *openstormlog(void) {
+  char path[PATH_MAX];
+  const char *state = getenv("XDG_STATE_HOME"), *home = getenv("HOME");
+  int n;
+
+  if (state && *state)
+    n = snprintf(path, sizeof path, "%s/dwm", state);
+  else if (home && *home) {
+    n = snprintf(path, sizeof path, "%s/.local", home);
+    if (n > 0 && (size_t)n < sizeof path)
+      mkdir(path, 0755);
+    n = snprintf(path, sizeof path, "%s/.local/state", home);
+    if (n > 0 && (size_t)n < sizeof path)
+      mkdir(path, 0755);
+    n = snprintf(path, sizeof path, "%s/.local/state/dwm", home);
+  } else
+    return NULL;
+  if (n < 0 || (size_t)n >= sizeof path - sizeof "/storm.log")
+    return NULL;
+  mkdir(path, 0700);
+  strcat(path, "/storm.log");
+  return fopen(path, "a");
+}
+
+static void stormreport(long long elapsed) {
+  char stamp[32], name[96];
+  unsigned int i, j, order[LASTEvent];
+  time_t now = time(NULL);
+  FILE *log;
+
+  if (!(log = openstormlog()))
+    return;
+  strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", localtime(&now));
+  fprintf(log, "%s storm: %lu events, %lu requests in %lld ms;", stamp,
+          storm.events, storm.requests, elapsed);
+  for (i = 0; i < LASTEvent; i++)
+    order[i] = i;
+  for (i = 0; i < 3; i++) {
+    for (j = i + 1; j < LASTEvent; j++)
+      if (storm.types[order[j]] > storm.types[order[i]]) {
+        unsigned int t = order[i];
+        order[i] = order[j];
+        order[j] = t;
+      }
+    if (!storm.types[order[i]])
+      break;
+    if (eventnames[order[i]])
+      fprintf(log, " %s %lu", eventnames[order[i]], storm.types[order[i]]);
+    else
+      fprintf(log, " event%u %lu", order[i], storm.types[order[i]]);
+  }
+  fputs("; windows:", log);
+  for (i = 0; i < StormWindows; i++)
+    if (storm.wins[i].n) {
+      stormwindowname(storm.wins[i].win, name, sizeof name);
+      fprintf(log, " 0x%lx (%s) %lu", storm.wins[i].win, name, storm.wins[i].n);
+    }
+  fputc('\n', log);
+  fclose(log);
+}
+
+/* Called for every event before it is handled. */
+static void stormcount(const XEvent *ev, long long now) {
+  unsigned int i, slot = 0;
+  Window w;
+
+  if (now - storm.start >= 1000) {
+    long long elapsed = now - storm.start;
+
+    storm.requests = NextRequest(dpy) - storm.reqbase;
+    if (storm.start &&
+        (storm.events * 1000 > stormevents * (unsigned long)elapsed ||
+         storm.requests * 1000 > stormrequests * (unsigned long)elapsed))
+      stormreport(elapsed);
+    memset(&storm, 0, sizeof storm);
+    storm.start = now;
+    storm.reqbase = NextRequest(dpy);
+  }
+  storm.events++;
+  if (ev->type >= 0 && ev->type < LASTEvent)
+    storm.types[ev->type]++;
+  /* Heavy hitters: an unseen window replaces the quietest slot. */
+  w = eventwindow(ev);
+  for (i = 0; i < StormWindows; i++) {
+    if (storm.wins[i].win == w && storm.wins[i].n) {
+      storm.wins[i].n++;
+      return;
+    }
+    if (storm.wins[i].n < storm.wins[slot].n)
+      slot = i;
+  }
+  storm.wins[slot].win = w;
+  storm.wins[slot].n = 1;
+}
+
 void run(void) {
   XEvent ev;
 
   XSync(dpy, False);
-  while (running && !XNextEvent(dpy, &ev))
+  while (running && !XNextEvent(dpy, &ev)) {
+    stormcount(&ev, monotonicms());
     if (ev.type >= 0 && ev.type < LASTEvent && handler[ev.type])
       handler[ev.type](&ev);
+  }
 }
 
 void scan(void) {
