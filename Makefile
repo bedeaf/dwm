@@ -25,9 +25,13 @@ config.h:
 dwm: ${OBJ}
 	${CC} -o $@ ${OBJ} ${LDFLAGS}
 
-test: tests/bar-labels tests/tray-order
+test: tests/bar-labels tests/tray-order tests/event-storm
 	./tests/bar-labels
 	./tests/tray-order
+	./tests/event-storm
+
+tests/event-storm: tests/event-storm.c dwm.c drw.c util.c config.h config.mk drw.h util.h push.c
+	${CC} ${CFLAGS} -Wno-unused-function -o $@ tests/event-storm.c drw.c util.c ${LDFLAGS}
 
 tests/bar-labels: tests/bar-labels.c dwm.c drw.c util.c config.h config.mk drw.h util.h push.c
 	${CC} ${CFLAGS} -Wno-unused-function -o $@ tests/bar-labels.c drw.c util.c ${LDFLAGS}
@@ -53,6 +57,7 @@ tests/swallow: tests/swallow.c dwm.c drw.c util.c config.h config.mk drw.h util.
 
 clean:
 	rm -f tests/swallow
+	rm -f tests/event-storm
 	rm -f tests/tray-stacking
 	rm -f tests/tray-order
 	rm -f tests/bar-labels
